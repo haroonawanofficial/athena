@@ -1,0 +1,73 @@
+# Core pages
+/
+home
+about
+contact
+login
+logout
+signup
+dashboard
+user/profile
+user/settings
+
+# Admin panels
+admin
+admin/login
+admin/dashboard
+admin/settings
+admin/api
+admin/console
+
+# Authentication & OAuth
+auth/login
+auth/logout
+auth/register
+oauth/token
+oauth/authorize
+
+# API versioned endpoints
+api
+api/v1/users
+api/v1/orders
+api/v2/users
+api/v2/products
+api/internal
+api/private
+api/admin
+graphql
+
+# Static files & bundles
+static/js/main.js
+static/css/main.css
+assets/js/app.js
+assets/css/style.css
+
+# Uploads & file access
+upload
+uploads
+files
+images
+docs
+
+# WebSocket & real‑time
+socket.io
+ws
+realtime
+
+# Health, metrics & status
+health
+status
+metrics
+actuator
+debug
+debug/console
+ping
+
+# Security & configuration
+robots.txt
+sitemap.xml
+.env
+.git
+config
+config.json
+.well‑known/security.txt
