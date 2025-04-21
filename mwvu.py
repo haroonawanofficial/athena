@@ -99,9 +99,9 @@ if args.ai:
         CODEBERT_MODEL     = AutoModelForMaskedLM.from_pretrained("microsoft/codebert-base")
         CODEBERT_MODEL.eval()
         USE_AI = True
-        logging.info("[AI] Loaded CodeBERT")
+        logging.info("[AI] Loaded AI")
     except Exception as e:
-        logging.warning(f"[AI] Failed to load CodeBERT: {e}")
+        logging.warning(f"[AI] Failed to load AI: {e}")
 
 def generate_ai_mutations(payload: str, num: int = 5):
     if not USE_AI:
