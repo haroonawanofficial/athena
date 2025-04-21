@@ -51,7 +51,11 @@ ssl._create_default_https_context = ssl._create_unverified_context
 
 TIMEOUT   = 8
 JITTER    = (0.35, 1.1)
-VERSION   = "1.3‑dynamic"
+VERSION = "1.3-dynamic"
+LOGFILE  = Path("redx_results.md")
+if not LOGFILE.exists():
+    with LOGFILE.open("w", encoding="utf-8") as f:
+        f.write(f"# Red-X Report {VERSION}\n\n")
 RAND      = ''.join(random.choices(string.ascii_lowercase, k=5))
 MARK      = f"cyz{RAND}"
 DNSLOG    = f"redx{random.randint(1000,9999)}.dnslog.cn" if args.dnslog else "disabled"
