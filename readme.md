@@ -50,7 +50,7 @@ AI-powered, ultra-comprehensive web vulnerability scanner and fuzzer that automa
 - **GraphQL Mutation** – blind mutation introspection beyond `__schema`  
 - **Polyglot Uploads** – JPEG+ZIP containers with server-side code payload  
 - **WASM Fuzz** – minimal Wasm binaries to trigger parser edge cases  
-- **AI-XSS Mutation** – CodeBERT mutation of `<script>alert()</script>` variants  
+- **AI-XSS Mutation** –  mutation of `<script>alert()</script>` variants  
 - **Prompt Injection** – LLM prompt attacks via form/JSON parameters  
 - **Prototype Pollution** – nested `__proto__` overrides and `constructor.prototype` injection  
 - **Smuggling Variants** – both “CL then TE” and “TE then CL” orderings  
@@ -69,7 +69,7 @@ AI-powered, ultra-comprehensive web vulnerability scanner and fuzzer that automa
 - **Custom Wordlist Routes** (`--routes`)  
   Brute-forces user-supplied paths (admin panels, health checks, etc.).  
 - **AI-Driven Mutation** (`--ai`)  
-  CodeBERT-powered XSS payload diversification.  
+  -powered XSS payload diversification.  
 - **Comprehensive Modules**  
   XXE, JSON deserialization, prototype-pollution, HTTP smuggling (sync & async), GraphQL introspection & mutations, prompt injection, polyglot uploads, WASM parsing, SSRF, HPP, CSP/CORS, Service Worker, JWT, SPA XSS, WebSocket, SSE.  
 - **Stealth & Fallbacks**  
