@@ -1,4 +1,4 @@
-# AI-Powered Web Exploit Engine - Athena (v1.4-dynamic)
+# AI-Powered Web Exploit Engine + C2 Framework
 
 ## Introduction  
 AI-powered, ultra-comprehensive web vulnerability scanner and fuzzer that automatically discovers and tests every endpoint—static links, dynamic SPA routes, REST/GraphQL APIs, JS bundles, uploads, WASM, XXE, deserialization, smuggling, prototype-pollution, and more, across any modern website or web app.
