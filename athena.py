@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Athena Unified Scanner & C2 Framework (v2.0)
-# Merged: Web Exploit Engine Athena v1.4-dynamic + Athena C2 & Payload Builder
-# Author  : Haroon Ahmad Awan · CyberZeus (extended)
+# Web Exploit Engine Athena v1.4-dynamic + Athena C2 & Payload Builder
+# Author  : Haroon Ahmad Awan · CyberZeus
 # License : MIT
 # =============================================================================
 
