@@ -5,6 +5,12 @@ AI-powered, ultra-comprehensive web vulnerability scanner and fuzzer that automa
 
 ---
 
+## Download the PDF here
+https://cyberzeus.pk/Athena_AI_Powered_Post_Exploitation_&_C2_Framework_Technical_Manual.pdf
+
+---
+
+
 ## New in v1.4-dynamic
 
 - **HTTP/2 Smuggling** (`--http2`)  
